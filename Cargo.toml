@@ -1,0 +1,37 @@
+[package]
+name = "qd-edge-ice"
+version = "0.1.0"
+edition = "2024"
+default-run = "qd-edge-ice"
+
+[[bin]]
+name = "qd-edge-ice"
+path = "src/main.rs"
+
+[[bin]]
+name = "verify_edge"
+path = "src/verify_edge.rs"
+
+
+[dependencies]
+# GUI. "tokio" feature gives us the async executor Task::perform runs on.
+# 0.14 (Dec 2025) needs a recent stable toolchain (rustc >= 1.85, edition 2024
+# internally) — make sure `rustup update stable` before building.
+iced = { version = "0.14", features = ["tokio"] }
+ 
+# HTTP client used to pull the shard snapshot from the Qdrant server.
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+futures-util = "0.3"
+ 
+# Async runtime primitives (spawn_blocking for the qdrant-edge unpack step,
+# which does blocking file I/O).
+tokio = { version = "1", features = ["fs", "rt", "rt-multi-thread", "macros"] }
+ 
+# Native "choose a folder" dialog for picking the local Edge Shard directory.
+rfd = "0.15"
+ 
+# Qdrant Edge — unpacks server-side shard snapshots into a local EdgeShard.
+ 
+anyhow = "1"
+qdrant-edge = "0.8.0"
+
