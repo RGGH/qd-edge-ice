@@ -1,5 +1,8 @@
 # Qdrant Edge Snapshotter
 
+<img width="1280" height="720" alt="iced-rs" src="https://github.com/user-attachments/assets/9dee77b8-1cb2-49cb-9dbd-102bed295a5e" />
+
+
 A small iced (0.14) desktop GUI that does what the Qdrant Edge docs describe by hand:
 
 1. **Download** a shard snapshot from a running Qdrant **server**
