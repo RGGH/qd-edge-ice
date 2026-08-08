@@ -13,7 +13,7 @@ pub fn main() -> iced::Result {
         .title("Qdrant Edge Snapshotter")
         .theme(App::theme)
         .window(window::Settings {
-            size: Size::new(640.0, 560.0),
+            size: Size::new(640.0, 720.0),
             ..Default::default()
         })
         .run()
