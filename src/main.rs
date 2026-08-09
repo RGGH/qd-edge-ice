@@ -1,9 +1,15 @@
 mod edge_sync;
 
-use iced::widget::{button, column, container, row, scrollable, space, text, text_input};
-use iced::{Element, Fill, Size, Task, Theme, window};
+use std::time::Duration;
 
-use edge_sync::{DownloadedSnapshot, SnapshotRequest};
+use futures_util::StreamExt;
+use iced::time::Instant;
+use iced::widget::{
+    button, column, container, progress_bar, row, scrollable, space, text, text_input,
+};
+use iced::{Animation, Element, Fill, Size, Subscription, Task, Theme, window};
+
+use edge_sync::{DownloadEvent, DownloadedSnapshot, SnapshotRequest};
 
 pub fn main() -> iced::Result {
     // In iced 0.14 the first argument to `application()` is the *boot*
@@ -12,8 +18,9 @@ pub fn main() -> iced::Result {
     iced::application(App::new, App::update, App::view)
         .title("Qdrant Edge Snapshotter")
         .theme(App::theme)
+        .subscription(App::subscription)
         .window(window::Settings {
-            size: Size::new(640.0, 720.0),
+            size: Size::new(640.0, 760.0),
             ..Default::default()
         })
         .run()
@@ -28,6 +35,10 @@ struct App {
 
     log: Vec<String>,
     busy: bool,
+
+    progress: Animation<f32>,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
 }
 
 impl Default for App {
@@ -40,6 +51,9 @@ impl Default for App {
             target_dir: "./qdrant-edge-directory".to_string(),
             log: vec!["Ready.".to_string()],
             busy: false,
+            progress: Animation::new(0.0).duration(Duration::from_millis(250)),
+            downloaded_bytes: 0,
+            total_bytes: None,
         }
     }
 }
@@ -56,8 +70,10 @@ enum Message {
     FolderPicked(Option<String>),
 
     Sync,
+    DownloadProgress { downloaded: u64, total: Option<u64> },
     Downloaded(Result<DownloadedSnapshot, String>),
     Unpacked(Result<String, String>),
+    Tick(Instant),
 }
 
 impl App {
@@ -71,6 +87,14 @@ impl App {
 
     fn push_log(&mut self, line: impl Into<String>) {
         self.log.push(line.into());
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        if self.progress.is_animating(Instant::now()) {
+            iced::window::frames().map(Message::Tick)
+        } else {
+            Subscription::none()
+        }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -114,6 +138,9 @@ impl App {
                 }
 
                 self.busy = true;
+                self.downloaded_bytes = 0;
+                self.total_bytes = None;
+                self.progress = Animation::new(0.0).duration(Duration::from_millis(250));
                 self.push_log(format!(
                     "Downloading snapshot of '{}' shard {} from {}…",
                     self.collection, self.shard_id, self.server_url
@@ -127,10 +154,37 @@ impl App {
                     target_dir: self.target_dir.clone(),
                 };
 
-                Task::perform(edge_sync::download_snapshot(req), Message::Downloaded)
+                Task::stream(edge_sync::download_snapshot_stream(req).map(|event| match event {
+                    DownloadEvent::Progress { downloaded, total } => {
+                        Message::DownloadProgress { downloaded, total }
+                    }
+                    DownloadEvent::Done(result) => Message::Downloaded(result),
+                }))
+            }
+
+            Message::DownloadProgress { downloaded, total } => {
+                self.downloaded_bytes = downloaded;
+                self.total_bytes = total;
+
+                // Download fills 0–90%; the last 10% is reserved for the
+                // unpack step, which has no granular progress signal.
+                let target = match total {
+                    Some(total) if total > 0 => {
+                        (downloaded as f32 / total as f32 * 90.0).min(90.0)
+                    }
+                    _ => {
+                        // No Content-Length: creep forward instead of
+                        // claiming a precision we don't have.
+                        let current = self.progress.interpolate_with(|v| v, Instant::now());
+                        (current + 2.0).min(85.0)
+                    }
+                };
+                self.progress = self.progress.clone().go(target, Instant::now());
+                Task::none()
             }
 
             Message::Downloaded(Ok(snap)) => {
+                self.progress = self.progress.clone().go(92.0, Instant::now());
                 self.push_log(format!(
                     "Downloaded {:.2} MB to {}. Unpacking into Edge Shard…",
                     snap.bytes as f64 / (1024.0 * 1024.0),
@@ -144,20 +198,25 @@ impl App {
             }
             Message::Downloaded(Err(err)) => {
                 self.busy = false;
+                self.progress = self.progress.clone().go(0.0, Instant::now());
                 self.push_log(format!("✗ Download failed: {err}"));
                 Task::none()
             }
 
             Message::Unpacked(Ok(summary)) => {
                 self.busy = false;
+                self.progress = self.progress.clone().go(100.0, Instant::now());
                 self.push_log(format!("✓ {summary}"));
                 Task::none()
             }
             Message::Unpacked(Err(err)) => {
                 self.busy = false;
+                self.progress = self.progress.clone().go(0.0, Instant::now());
                 self.push_log(format!("✗ Unpack failed: {err}"));
                 Task::none()
             }
+
+            Message::Tick(_now) => Task::none(),
         }
     }
 
@@ -190,6 +249,27 @@ impl App {
                 .padding([10, 20])
                 .on_press(Message::Sync)
         };
+
+        let progress_value = self.progress.interpolate_with(|v| v, Instant::now());
+        let progress_label = match self.total_bytes {
+            Some(total) if total > 0 => format!(
+                "{:.0}% · {:.1} MB / {:.1} MB",
+                progress_value,
+                self.downloaded_bytes as f64 / (1024.0 * 1024.0),
+                total as f64 / (1024.0 * 1024.0),
+            ),
+            _ if self.busy => format!(
+                "{:.1} MB downloaded",
+                self.downloaded_bytes as f64 / (1024.0 * 1024.0)
+            ),
+            _ => String::new(),
+        };
+
+        let progress_section = column![
+            progress_bar(0.0..=100.0, progress_value),
+            text(progress_label).size(12),
+        ]
+        .spacing(4);
 
         let log_view = scrollable(
             column(
@@ -236,7 +316,8 @@ impl App {
             column![text("Local Edge Shard directory").size(13), target_dir_row,].spacing(4),
             space().height(4),
             sync_button,
-            space().height(8),
+            progress_section,
+            space().height(4),
             text("Log").size(13),
             container(log_view).height(Fill).width(Fill),
         ]

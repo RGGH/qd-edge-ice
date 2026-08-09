@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 /// Everything the UI needs to know to build a snapshot request.
 #[derive(Debug, Clone)]
@@ -20,12 +22,35 @@ pub struct DownloadedSnapshot {
     pub bytes: u64,
 }
 
-/// GET /collections/{collection}/shards/{shard}/snapshot from the server and
-/// stream it to a temp file on disk.
-///
-/// Mirrors the pattern in the Qdrant Edge docs:
-/// https://qdrant.tech/documentation/edge/edge-data-synchronization-patterns/
-pub async fn download_snapshot(req: SnapshotRequest) -> Result<DownloadedSnapshot, String> {
+/// Progress events emitted while a snapshot streams to disk.
+#[derive(Debug, Clone)]
+pub enum DownloadEvent {
+    /// `total` is `None` when the server didn't send a `Content-Length`
+    /// header — in that case the UI should treat the bar as indeterminate
+    /// rather than claiming a precise percentage.
+    Progress { downloaded: u64, total: Option<u64> },
+    Done(Result<DownloadedSnapshot, String>),
+}
+
+/// Streams progress events while a snapshot downloads, so the UI can show
+/// real progress instead of just "busy" while waiting on one big future.
+pub fn download_snapshot_stream(
+    req: SnapshotRequest,
+) -> impl Stream<Item = DownloadEvent> + Send + 'static {
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        let result = run_download(req, tx.clone()).await;
+        let _ = tx.send(DownloadEvent::Done(result));
+    });
+
+    UnboundedReceiverStream::new(rx)
+}
+
+async fn run_download(
+    req: SnapshotRequest,
+    tx: mpsc::UnboundedSender<DownloadEvent>,
+) -> Result<DownloadedSnapshot, String> {
     let base = req.server_url.trim_end_matches('/');
     let url = format!(
         "{base}/collections/{}/shards/{}/snapshot",
@@ -49,6 +74,8 @@ pub async fn download_snapshot(req: SnapshotRequest) -> Result<DownloadedSnapsho
         return Err(format!("Server returned {status} for {url}: {body}"));
     }
 
+    let total = response.content_length();
+
     let file_name = format!("{}-shard-{}.snapshot", req.collection, req.shard_id);
     let out_path = std::env::temp_dir().join(file_name);
 
@@ -58,25 +85,27 @@ pub async fn download_snapshot(req: SnapshotRequest) -> Result<DownloadedSnapsho
 
     let mut stream = response.bytes_stream();
     let mut written: u64 = 0;
+
+    // Fire an initial 0% event as soon as headers arrive, so the bar
+    // appears right away instead of staying invisible until the first chunk.
+    let _ = tx.send(DownloadEvent::Progress { downloaded: 0, total });
+
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("Error while downloading snapshot: {e}"))?;
         file.write_all(&chunk)
             .await
             .map_err(|e| format!("Error while writing snapshot to disk: {e}"))?;
         written += chunk.len() as u64;
+
+        let _ = tx.send(DownloadEvent::Progress { downloaded: written, total });
     }
     file.flush().await.map_err(|e| e.to_string())?;
 
-    Ok(DownloadedSnapshot {
-        path: out_path,
-        bytes: written,
-    })
+    Ok(DownloadedSnapshot { path: out_path, bytes: written })
 }
 
 /// Unpack a downloaded .snapshot file into a local Qdrant Edge Shard directory,
-/// then load it to confirm it's valid. This replaces `target_dir` entirely, as
-/// `EdgeShard::unpack_snapshot` / `EdgeShard::new` expect an empty directory
-/// (see the Edge Quickstart and Synchronization Guide).
+/// then load it to confirm it's valid.
 pub async fn unpack_snapshot_to_edge(
     snapshot_path: PathBuf,
     target_dir: String,

@@ -34,4 +34,5 @@ rfd = "0.15"
  
 anyhow = "1"
 qdrant-edge = "0.8.0"
+tokio-stream = "0.1.19"
 
