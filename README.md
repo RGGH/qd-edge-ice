@@ -14,17 +14,6 @@ This follows the pattern from:
 - https://qdrant.tech/documentation/edge/edge-data-synchronization-patterns/#initialize-edge-shard-from-existing-qdrant-collection
 - https://qdrant.tech/documentation/edge/edge-synchronization-guide/
 
-
-## Verifying a sync actually worked
-
-There's a second binary in this crate, `verify_edge`, that loads a synced
-Edge Shard and runs a query against it — useful for confirming the GUI's
-sync actually populated real data rather than an empty shard.
-
-```bash
-cargo run --bin verify_edge -- ./qdrant-edge-directory my-vector 0.1 0.2 0.3 0.4
-```
-
 Important: `EdgeShard::load` opens an **existing** shard, it does not create
 one. Point it at the exact same directory (same working directory or same
 absolute path) that you gave the GUI's "Local Edge Shard directory" field,
@@ -42,7 +31,7 @@ cargo run
 ```
 
 ```bash
-cargo r --bin qd-edge-ice
+cargo r
 ```
 
 First build will take a while — it pulls in `wgpu` (iced's renderer).
