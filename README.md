@@ -26,7 +26,7 @@ verifier itself.
 
 ```bash
 rustup update stable   # make sure you're on a recent toolchain
-cd qdrant-edge-snapshotter
+cd qdrant-edge-ice
 cargo run
 ```
 
