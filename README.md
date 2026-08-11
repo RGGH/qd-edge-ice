@@ -1,4 +1,5 @@
-# Qdrant Edge Snapshotter
+# Qdrant Edge Snapshot Synch from Server
+[![Rust](https://github.com/RGGH/qd-edge-ice/actions/workflows/rust.yml/badge.svg)](https://github.com/RGGH/qd-edge-ice/actions/workflows/rust.yml)
 
 <img width="1280" height="720" alt="iced-rs" src="https://github.com/user-attachments/assets/9dee77b8-1cb2-49cb-9dbd-102bed295a5e" />
 
