@@ -7,34 +7,63 @@ use iced::time::Instant;
 use iced::widget::{
     button, column, container, progress_bar, row, scrollable, space, text, text_input,
 };
-use iced::{Animation, Element, Fill, Size, Subscription, Task, Theme, window};
+use iced::{Animation, Element, Fill, Font, Size, Subscription, Task, Theme, window};
 
-use edge_sync::{DownloadEvent, DownloadedSnapshot, SnapshotRequest};
+use edge_sync::{CollectionSyncRequest, SyncEvent};
+
+const MONA_SANS: &[u8] = include_bytes!("assets/fonts/MonaSans-Regular.ttf");
+const MONA_SANS_FONT: Font = Font::with_name("Mona Sans");
 
 pub fn main() -> iced::Result {
     // In iced 0.14 the first argument to `application()` is the *boot*
     // function (State, or (State, Task<Message>)), not the title — title is
     // set via `.title(...)` below.
     iced::application(App::new, App::update, App::view)
-        .title("Qdrant Edge Snapshotter")
+        .title("Qdrant Edge Sync")
         .theme(App::theme)
         .subscription(App::subscription)
+        .font(MONA_SANS) // registers the bytes at boot
+        .default_font(MONA_SANS_FONT) // makes it the default for every text widget
         .window(window::Settings {
             size: Size::new(640.0, 760.0),
+            icon: window_icon(),
             ..Default::default()
         })
         .run()
+}
+
+/// Loads `src/assets/qdrant.png`, embedded at compile time, and decodes it
+/// into a window icon. Requires iced's `image` feature (see Cargo.toml) to
+/// decode PNG bytes — without it only raw RGBA icons are supported.
+///
+/// Note this sets the *window* icon (titlebar/taskbar/dock while running).
+/// A packaged app icon (Windows .exe icon, macOS .app bundle icon) is a
+/// separate, platform-specific packaging step — this alone won't cover that.
+fn window_icon() -> Option<window::icon::Icon> {
+    let bytes = include_bytes!("assets/qdrant.png");
+    match window::icon::from_file_data(bytes, None) {
+        Ok(icon) => Some(icon),
+        Err(err) => {
+            eprintln!("Could not load window icon from assets/qdrant.png: {err}");
+            None
+        }
+    }
 }
 
 struct App {
     server_url: String,
     api_key: String,
     collection: String,
-    shard_id: String,
     target_dir: String,
 
     log: Vec<String>,
     busy: bool,
+
+    // All shards discovered for the collection, and where we are in them.
+    shards: Vec<u32>,
+    total_shards: usize,
+    current_shard: Option<u32>,
+    current_shard_index: usize,
 
     progress: Animation<f32>,
     downloaded_bytes: u64,
@@ -47,10 +76,13 @@ impl Default for App {
             server_url: "http://localhost:6333".to_string(),
             api_key: String::new(),
             collection: String::new(),
-            shard_id: "0".to_string(),
             target_dir: "./qdrant-edge-directory".to_string(),
             log: vec!["Ready.".to_string()],
             busy: false,
+            shards: Vec::new(),
+            total_shards: 0,
+            current_shard: None,
+            current_shard_index: 0,
             progress: Animation::new(0.0).duration(Duration::from_millis(250)),
             downloaded_bytes: 0,
             total_bytes: None,
@@ -63,16 +95,32 @@ enum Message {
     ServerUrlChanged(String),
     ApiKeyChanged(String),
     CollectionChanged(String),
-    ShardIdChanged(String),
     TargetDirChanged(String),
 
     PickFolder,
     FolderPicked(Option<String>),
 
     Sync,
-    DownloadProgress { downloaded: u64, total: Option<u64> },
-    Downloaded(Result<DownloadedSnapshot, String>),
-    Unpacked(Result<String, String>),
+    ShardsDiscovered(Vec<u32>),
+    ShardStarted {
+        shard_id: u32,
+        index: usize,
+        total_shards: usize,
+    },
+    ShardProgress {
+        shard_id: u32,
+        downloaded: u64,
+        total: Option<u64>,
+    },
+    ShardCompleted {
+        shard_id: u32,
+        summary: String,
+    },
+    ShardFailed {
+        shard_id: u32,
+        error: String,
+    },
+    SyncDone(Result<(), String>),
     Tick(Instant),
 }
 
@@ -97,6 +145,18 @@ impl App {
         }
     }
 
+    /// Overall progress (0..100) across every shard. Each shard owns an
+    /// equal-width slice of the bar; `shard_fraction` is how far (0..100)
+    /// we are through the *current* shard's slice.
+    fn overall_progress(&self, shard_fraction: f32) -> f32 {
+        if self.total_shards == 0 {
+            return 0.0;
+        }
+        let completed = self.current_shard_index as f32;
+        let total = self.total_shards as f32;
+        ((completed + shard_fraction / 100.0) / total * 100.0).clamp(0.0, 100.0)
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::ServerUrlChanged(v) => {
@@ -109,10 +169,6 @@ impl App {
             }
             Message::CollectionChanged(v) => {
                 self.collection = v;
-                Task::none()
-            }
-            Message::ShardIdChanged(v) => {
-                self.shard_id = v;
                 Task::none()
             }
             Message::TargetDirChanged(v) => {
@@ -138,81 +194,155 @@ impl App {
                 }
 
                 self.busy = true;
+                self.shards.clear();
+                self.total_shards = 0;
+                self.current_shard = None;
+                self.current_shard_index = 0;
                 self.downloaded_bytes = 0;
                 self.total_bytes = None;
                 self.progress = Animation::new(0.0).duration(Duration::from_millis(250));
                 self.push_log(format!(
-                    "Downloading snapshot of '{}' shard {} from {}…",
-                    self.collection, self.shard_id, self.server_url
+                    "Discovering shards for '{}' on {}…",
+                    self.collection, self.server_url
                 ));
 
-                let req = SnapshotRequest {
+                let req = CollectionSyncRequest {
                     server_url: self.server_url.clone(),
                     api_key: self.api_key.clone(),
                     collection: self.collection.clone(),
-                    shard_id: self.shard_id.clone(),
                     target_dir: self.target_dir.clone(),
                 };
 
-                Task::stream(edge_sync::download_snapshot_stream(req).map(|event| match event {
-                    DownloadEvent::Progress { downloaded, total } => {
-                        Message::DownloadProgress { downloaded, total }
-                    }
-                    DownloadEvent::Done(result) => Message::Downloaded(result),
-                }))
+                Task::stream(
+                    edge_sync::sync_all_shards_stream(req).map(|event| match event {
+                        SyncEvent::ShardsDiscovered(ids) => Message::ShardsDiscovered(ids),
+                        SyncEvent::ShardStarted {
+                            shard_id,
+                            index,
+                            total_shards,
+                        } => Message::ShardStarted {
+                            shard_id,
+                            index,
+                            total_shards,
+                        },
+                        SyncEvent::Progress {
+                            shard_id,
+                            downloaded,
+                            total,
+                        } => Message::ShardProgress {
+                            shard_id,
+                            downloaded,
+                            total,
+                        },
+                        SyncEvent::ShardCompleted { shard_id, summary } => {
+                            Message::ShardCompleted { shard_id, summary }
+                        }
+                        SyncEvent::ShardFailed { shard_id, error } => {
+                            Message::ShardFailed { shard_id, error }
+                        }
+                        SyncEvent::Done(result) => Message::SyncDone(result),
+                    }),
+                )
             }
 
-            Message::DownloadProgress { downloaded, total } => {
+            Message::ShardsDiscovered(ids) => {
+                self.total_shards = ids.len();
+                self.push_log(format!(
+                    "Found {} shard(s): {}",
+                    ids.len(),
+                    ids.iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                self.shards = ids;
+                Task::none()
+            }
+
+            Message::ShardStarted {
+                shard_id,
+                index,
+                total_shards,
+            } => {
+                self.current_shard = Some(shard_id);
+                self.current_shard_index = index;
+                self.total_shards = total_shards;
+                self.downloaded_bytes = 0;
+                self.total_bytes = None;
+                self.push_log(format!(
+                    "[{}/{}] Downloading snapshot of shard {shard_id}…",
+                    index + 1,
+                    total_shards
+                ));
+                Task::none()
+            }
+
+            Message::ShardProgress {
+                shard_id,
+                downloaded,
+                total,
+            } => {
+                if self.current_shard != Some(shard_id) {
+                    return Task::none();
+                }
                 self.downloaded_bytes = downloaded;
                 self.total_bytes = total;
 
-                // Download fills 0–90%; the last 10% is reserved for the
-                // unpack step, which has no granular progress signal.
-                let target = match total {
-                    Some(total) if total > 0 => {
-                        (downloaded as f32 / total as f32 * 90.0).min(90.0)
-                    }
+                // Download fills 0–90% of this shard's slice; the last 10%
+                // is reserved for the unpack step, which has no granular
+                // progress signal.
+                let shard_fraction = match total {
+                    Some(total) if total > 0 => (downloaded as f32 / total as f32 * 90.0).min(90.0),
                     _ => {
                         // No Content-Length: creep forward instead of
                         // claiming a precision we don't have.
-                        let current = self.progress.interpolate_with(|v| v, Instant::now());
-                        (current + 2.0).min(85.0)
+                        let current_overall = self.progress.interpolate_with(|v| v, Instant::now());
+                        let current_shard_fraction = if self.total_shards > 0 {
+                            (current_overall / 100.0 * self.total_shards as f32
+                                - self.current_shard_index as f32)
+                                * 100.0
+                        } else {
+                            0.0
+                        };
+                        (current_shard_fraction + 2.0).min(85.0)
                     }
                 };
+
+                let target = self.overall_progress(shard_fraction);
                 self.progress = self.progress.clone().go(target, Instant::now());
                 Task::none()
             }
 
-            Message::Downloaded(Ok(snap)) => {
-                self.progress = self.progress.clone().go(92.0, Instant::now());
-                self.push_log(format!(
-                    "Downloaded {:.2} MB to {}. Unpacking into Edge Shard…",
-                    snap.bytes as f64 / (1024.0 * 1024.0),
-                    snap.path.display()
-                ));
-
-                Task::perform(
-                    edge_sync::unpack_snapshot_to_edge(snap.path, self.target_dir.clone()),
-                    Message::Unpacked,
-                )
-            }
-            Message::Downloaded(Err(err)) => {
-                self.busy = false;
-                self.progress = self.progress.clone().go(0.0, Instant::now());
-                self.push_log(format!("✗ Download failed: {err}"));
+            Message::ShardCompleted { shard_id, summary } => {
+                self.push_log(format!("✓ Shard {shard_id}: {summary}"));
+                let target = self.overall_progress(100.0);
+                self.progress = self.progress.clone().go(target, Instant::now());
                 Task::none()
             }
 
-            Message::Unpacked(Ok(summary)) => {
+            Message::ShardFailed { shard_id, error } => {
+                self.push_log(format!("✗ Shard {shard_id} failed: {error}"));
+                // Still advance the bar — this shard's slice is "done"
+                // (unsuccessfully) and we move on to the next one.
+                let target = self.overall_progress(100.0);
+                self.progress = self.progress.clone().go(target, Instant::now());
+                Task::none()
+            }
+
+            Message::SyncDone(Ok(())) => {
                 self.busy = false;
+                self.current_shard = None;
                 self.progress = self.progress.clone().go(100.0, Instant::now());
-                self.push_log(format!("✓ {summary}"));
+                self.push_log(format!(
+                    "✓ All {} shard(s) synced to {}",
+                    self.total_shards, self.target_dir
+                ));
                 Task::none()
             }
-            Message::Unpacked(Err(err)) => {
+            Message::SyncDone(Err(err)) => {
                 self.busy = false;
-                self.progress = self.progress.clone().go(0.0, Instant::now());
-                self.push_log(format!("✗ Unpack failed: {err}"));
+                self.current_shard = None;
+                self.push_log(format!("✗ Sync finished with errors: {err}"));
                 Task::none()
             }
 
@@ -245,24 +375,33 @@ impl App {
         let sync_button = if self.busy {
             button(text("Working…")).padding([10, 20])
         } else {
-            button(text("Download snapshot & sync to Edge"))
+            button(text("Sync all shards to Edge"))
                 .padding([10, 20])
                 .on_press(Message::Sync)
         };
 
         let progress_value = self.progress.interpolate_with(|v| v, Instant::now());
-        let progress_label = match self.total_bytes {
-            Some(total) if total > 0 => format!(
-                "{:.0}% · {:.1} MB / {:.1} MB",
-                progress_value,
-                self.downloaded_bytes as f64 / (1024.0 * 1024.0),
-                total as f64 / (1024.0 * 1024.0),
-            ),
-            _ if self.busy => format!(
-                "{:.1} MB downloaded",
-                self.downloaded_bytes as f64 / (1024.0 * 1024.0)
-            ),
-            _ => String::new(),
+        let progress_label = if self.total_shards > 0 {
+            let shard_part = match (self.current_shard, self.total_bytes) {
+                (Some(shard_id), Some(total)) if total > 0 => format!(
+                    "shard {shard_id} ({}/{}) · {:.1} MB / {:.1} MB",
+                    self.current_shard_index + 1,
+                    self.total_shards,
+                    self.downloaded_bytes as f64 / (1024.0 * 1024.0),
+                    total as f64 / (1024.0 * 1024.0),
+                ),
+                (Some(shard_id), _) => format!(
+                    "shard {shard_id} ({}/{}) · {:.1} MB downloaded",
+                    self.current_shard_index + 1,
+                    self.total_shards,
+                    self.downloaded_bytes as f64 / (1024.0 * 1024.0),
+                ),
+                (None, _) if self.busy => "finishing up…".to_string(),
+                (None, _) => String::new(),
+            };
+            format!("{:.0}% · {shard_part}", progress_value)
+        } else {
+            String::new()
         };
 
         let progress_section = column![
@@ -286,7 +425,8 @@ impl App {
         let content = column![
             text("Qdrant Server → Qdrant Edge").size(22),
             text(
-                "Pull a shard snapshot from a Qdrant server and unpack it into a local Edge Shard."
+                "Pulls a snapshot of every shard in a collection and unpacks each one into its \
+                 own local Edge Shard, so the whole collection stays in sync by default."
             )
             .size(13),
             space().height(8),
@@ -302,18 +442,17 @@ impl App {
                 "",
                 Message::ApiKeyChanged
             ),
-            row![
-                field(
-                    "Collection",
-                    &self.collection,
-                    "my-collection",
-                    Message::CollectionChanged
-                )
-                .width(Fill),
-                field("Shard ID", &self.shard_id, "0", Message::ShardIdChanged).width(120),
+            field(
+                "Collection",
+                &self.collection,
+                "my-collection",
+                Message::CollectionChanged
+            ),
+            column![
+                text("Local Edge Shard directory (one subfolder per shard)").size(13),
+                target_dir_row,
             ]
-            .spacing(12),
-            column![text("Local Edge Shard directory").size(13), target_dir_row,].spacing(4),
+            .spacing(4),
             space().height(4),
             sync_button,
             progress_section,
@@ -330,7 +469,7 @@ impl App {
 
 async fn pick_folder() -> Option<String> {
     rfd::AsyncFileDialog::new()
-        .set_title("Choose (or create) the local Edge Shard directory")
+        .set_title("Choose (or create) the parent directory for Edge Shards")
         .pick_folder()
         .await
         .map(|handle| handle.path().to_string_lossy().to_string())
