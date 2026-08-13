@@ -1,10 +1,6 @@
 # Qdrant Edge Sync
-<img width="1280" height="720" alt="iced-rs" src="https://github.com/user-attachments/assets/9dee77b8-1cb2-49cb-9dbd-102bed295a5e" />
 
 <img width="1280" height="720" alt="2026-08-13 12-45-46" src="https://github.com/user-attachments/assets/0b587fb4-86e0-4a70-ba78-d73ed66c0d89" />
-
-
-
 
 A small iced (0.14) desktop GUI that does what the Qdrant Edge docs describe by hand:
 
