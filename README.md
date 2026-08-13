@@ -1,4 +1,4 @@
-# Qdrant Edge Snapshot Synch from Server
+# Qdrant Edge Sync
 [![Rust](https://github.com/RGGH/qd-edge-ice/actions/workflows/rust.yml/badge.svg)](https://github.com/RGGH/qd-edge-ice/actions/workflows/rust.yml)
 
 <img width="1280" height="720" alt="iced-rs" src="https://github.com/user-attachments/assets/9dee77b8-1cb2-49cb-9dbd-102bed295a5e" />
@@ -51,16 +51,11 @@ First build will take a while — it pulls in `wgpu` (iced's renderer).
 
 ## Known simplifications / good next steps
 
-- **No progress bar for the download itself.** `Task::perform` only reports
-  one final value; a byte-level progress bar needs `iced::Subscription` or
-  `Task::stream` piping chunk counts back as messages. Happy to add this.
 - **Full snapshot only.** The docs also describe *partial* snapshots
   (`snapshot_manifest()` + `POST .../snapshot/partial/create` +
   `update_from_snapshot`) for cheap incremental re-syncs — worth adding as a
   "Re-sync" button once you have this compiling, so you're not re-downloading
   the whole shard every time.
-- **Single shard only.** If your collection has more than one shard, you'd
-  want a dropdown to list/select shard IDs rather than a free-text field.
 - **No dual-write / mutable shard side.** This tool only covers
   server → Edge. The full pattern in the docs also has a *mutable* local
   shard for offline writes that get queued back up to the server — out of
