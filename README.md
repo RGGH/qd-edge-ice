@@ -65,5 +65,3 @@ First build will take a while — it pulls in `wgpu` (iced's renderer).
 - `Cargo.toml`
 - `src/main.rs` — iced UI (state, messages, view)
 - `src/edge_sync.rs` — snapshot download + unpack logic, independent of the UI
-
-
