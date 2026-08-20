@@ -350,7 +350,7 @@ impl App {
         }
     }
 
-    fn view(&self) -> Element<Message> {
+    fn view(&self) -> Element<'_, Message> {
         let field =
             |label: &str, value: &str, placeholder: &str, on_change: fn(String) -> Message| {
                 column![
